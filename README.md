@@ -1,22 +1,22 @@
 # Codex 额度重置通知插件
 
-该插件每 5 分钟读取一次 `https://codex-reset.com/api/forecast`。当网站的 `last_reset_at` 发生变化时，插件会同时显示网站原始 UTC 时间和转换后的北京时间：
+该插件每 5 分钟读取一次 `https://codex-resets.com/api/v1/resets?limit=20&order=desc`，并选取最新的 `regular` 重置公告。当公告 `id` 发生变化时，插件会同时显示 API 中的 UTC 时间和转换后的北京时间：
 
 ```text
-Latest Codex limit reset：2026-08-31 02:34:27 UTC
+Latest Codex limit reset：2026-08-31 02:29:25 UTC
 
-最新的codex额度重置时间：2026-08-31 10:34:27 北京时间
+最新的codex额度重置时间：2026-08-31 10:29:25 北京时间
 ```
 
-文本通知发送后，插件会用 Playwright 直接打开 `https://codex-resets.com/` 主页，并紧接着发送“Codex reset announcements”标题和第一条最新公告的 PNG 截图。文本通知本身不再附带公告帖子正文。
+文本通知发送后，插件会用 Playwright 直接打开同一站点的主页，用 API 返回的 `source.url` 精确匹配同一条公告，然后发送“Codex reset announcements”标题和该公告卡片的 PNG 截图。如果公告没有来源链接，则使用 `announced_at` 精确匹配。文本通知本身不附带公告帖子正文。
 
-重置变化仍以 `https://codex-reset.com/api/forecast` 为数据源。两个网站对同一公告的时间记录可能存在数分钟差异，插件只在两者相差不超过 15 分钟时发送截图。
+API 请求会使用 `ETag` 条件请求减少重复传输。从 1.3.x 升级时，插件会将旧时间状态静默迁移到新公告 ID，避免对已发送的公告重复通知。
 
 文本和图片分别记录投递状态：如果文本已发送但截图暂时失败，后续扫描只重试图片，不会重复发送文本。投递记录保存在 MaiBot 分配的插件数据目录中。
 
 ## 指令
 
-- `/reset`：实时查询 codex-reset.com，并在当前聊天返回最近一次重置通知。该指令不受通知白名单限制。
+- `/reset`：实时查询 codex-resets.com，并在当前聊天返回最近一次重置文本与对应公告截图。该指令不受通知白名单限制。
 
 ## 截图依赖
 

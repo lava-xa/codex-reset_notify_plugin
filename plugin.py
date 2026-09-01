@@ -17,14 +17,16 @@ from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, Command, Field, MaiBotPlugin, P
 from playwright.async_api import Error as PlaywrightError, async_playwright
 
 
-DATA_SITE_URL = "https://codex-reset.com/"
-SCREENSHOT_SITE_URL = "https://codex-resets.com/"
-FORECAST_URL = f"{DATA_SITE_URL}api/forecast"
+SITE_URL = "https://codex-resets.com/"
+RESET_LIST_LIMIT = 20
+RESET_LIST_URL = f"{SITE_URL}api/v1/resets?limit={RESET_LIST_LIMIT}&order=desc"
 ANNOUNCEMENT_SECTION_SELECTOR = ".log-section"
-LATEST_RESET_ANNOUNCEMENT_SELECTOR = f"{ANNOUNCEMENT_SECTION_SELECTOR} > .log-list > .log-item"
+RESET_ANNOUNCEMENT_SELECTOR = f"{ANNOUNCEMENT_SECTION_SELECTOR} .log-item"
 ANNOUNCEMENT_MORE_SELECTOR = f"{ANNOUNCEMENT_SECTION_SELECTOR} > .log-more"
 ANNOUNCEMENT_TIME_SELECTOR = ".log-item-time"
 ANNOUNCEMENT_AVATAR_SELECTOR = ".log-avatar"
+ANNOUNCEMENT_LINK_SELECTOR = ".log-item-link"
+ANNOUNCEMENT_TARGET_ATTRIBUTE = "data-codex-reset-screenshot-target"
 ANNOUNCEMENT_CROP_STYLE = f"""
 .graph-section {{
     visibility: hidden !important;
@@ -32,11 +34,11 @@ ANNOUNCEMENT_CROP_STYLE = f"""
 {ANNOUNCEMENT_SECTION_SELECTOR} {{
     padding-top: 0 !important;
 }}
-{LATEST_RESET_ANNOUNCEMENT_SELECTOR}:not(:first-child),
+{RESET_ANNOUNCEMENT_SELECTOR}:not([{ANNOUNCEMENT_TARGET_ATTRIBUTE}]),
 {ANNOUNCEMENT_MORE_SELECTOR} {{
     display: none !important;
 }}
-{LATEST_RESET_ANNOUNCEMENT_SELECTOR}:first-child {{
+{RESET_ANNOUNCEMENT_SELECTOR}[{ANNOUNCEMENT_TARGET_ATTRIBUTE}] {{
     animation: none !important;
     opacity: 1 !important;
     transform: none !important;
@@ -47,12 +49,12 @@ SCAN_INTERVAL_SECONDS = 300
 REQUEST_TIMEOUT_SECONDS = 30
 SCREENSHOT_TIMEOUT_MS = 30_000
 SCREENSHOT_STABILIZE_MS = 1_500
-SCREENSHOT_RESET_TIME_TOLERANCE_SECONDS = 15 * 60
 SCREENSHOT_VIEWPORT_WIDTH = 1_800
 SCREENSHOT_VIEWPORT_HEIGHT = 1_000
+LEGACY_STATE_TIME_TOLERANCE_SECONDS = 15 * 60
 STATE_FILE_NAME = "state.json"
-STATE_VERSION = 3
-USER_AGENT = "MaiBot-Codex-Reset-Notify-Plugin/1.3.2"
+STATE_VERSION = 4
+USER_AGENT = "MaiBot-Codex-Reset-Notify-Plugin/1.4.0"
 BEIJING_TIMEZONE = ZoneInfo("Asia/Shanghai")
 BROWSER_EXECUTABLE_NAMES = (
     "google-chrome",
@@ -64,9 +66,11 @@ BROWSER_EXECUTABLE_NAMES = (
 
 @dataclass(frozen=True)
 class ResetSnapshot:
-    """codex-reset.com 上最新的已确认重置信息。"""
+    """codex-resets.com 上最新的普通重置信息。"""
 
+    reset_id: str
     reset_at: str
+    source_url: Optional[str]
 
 
 @dataclass(frozen=True)
@@ -87,7 +91,9 @@ class NotificationTarget:
 class MonitorState:
     """持久化的监控与逐目标投递状态。"""
 
+    reset_id: Optional[str]
     reset_at: str
+    source_url: Optional[str]
     target_keys: List[str]
     text_delivered_target_keys: Set[str]
     image_delivered_target_keys: Set[str]
@@ -97,7 +103,7 @@ class MonitorState:
         """从持久化字典中构造状态并校验关键字段。"""
 
         state_version = payload.get("version")
-        if state_version not in {1, 2, STATE_VERSION}:
+        if state_version not in {1, 2, 3, STATE_VERSION}:
             raise ValueError(f"不支持的状态文件版本: {payload.get('version')!r}")
 
         reset_at = payload.get("reset_at")
@@ -115,8 +121,17 @@ class MonitorState:
             text_delivered_target_keys = set(cls._required_string_list(payload, "text_delivered_target_keys"))
             image_delivered_target_keys = set(cls._required_string_list(payload, "image_delivered_target_keys"))
 
+        if state_version == STATE_VERSION:
+            reset_id = cls._optional_string(payload, "reset_id")
+            source_url = cls._optional_string(payload, "source_url")
+        else:
+            reset_id = None
+            source_url = None
+
         return cls(
+            reset_id=reset_id,
             reset_at=reset_at.strip(),
+            source_url=source_url,
             target_keys=list(dict.fromkeys(target_keys)),
             text_delivered_target_keys=text_delivered_target_keys,
             image_delivered_target_keys=image_delivered_target_keys,
@@ -131,16 +146,40 @@ class MonitorState:
             raise ValueError(f"状态文件中的 {field_name} 必须是字符串列表")
         return value
 
+    @staticmethod
+    def _optional_string(payload: Dict[str, Any], field_name: str) -> Optional[str]:
+        """从状态字典读取可选的非空字符串。"""
+
+        value = payload.get(field_name)
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"状态文件中的 {field_name} 必须是非空字符串或 null")
+        return value.strip()
+
     def to_dict(self) -> Dict[str, Any]:
         """转换为可写入 JSON 的字典。"""
 
         return {
             "version": STATE_VERSION,
+            "reset_id": self.reset_id,
             "reset_at": self.reset_at,
+            "source_url": self.source_url,
             "target_keys": self.target_keys,
             "text_delivered_target_keys": sorted(self.text_delivered_target_keys),
             "image_delivered_target_keys": sorted(self.image_delivered_target_keys),
         }
+
+    def to_snapshot(self) -> ResetSnapshot:
+        """转换为可用于投递与截图的重置快照。"""
+
+        if self.reset_id is None:
+            raise RuntimeError("旧版状态尚未迁移，缺少 reset_id")
+        return ResetSnapshot(
+            reset_id=self.reset_id,
+            reset_at=self.reset_at,
+            source_url=self.source_url,
+        )
 
 
 class PluginSectionConfig(PluginConfigBase):
@@ -196,6 +235,8 @@ class CodexResetNotifyPlugin(MaiBotPlugin):
         self._http_session: Optional[ClientSession] = None
         self._monitor_task: Optional[asyncio.Task[None]] = None
         self._state: Optional[MonitorState] = None
+        self._resets_etag: Optional[str] = None
+        self._cached_snapshot: Optional[ResetSnapshot] = None
         self._screenshot_lock = asyncio.Lock()
 
     async def on_load(self) -> None:
@@ -239,7 +280,7 @@ class CodexResetNotifyPlugin(MaiBotPlugin):
 
     @Command(
         "codex_reset_latest",
-        description="查询 codex-reset.com 最近一次 Codex 额度重置通知",
+        description="查询 codex-resets.com 最近一次 Codex 额度重置通知",
         pattern=r"^/reset$",
     )
     async def handle_reset_command(self, stream_id: str = "", **kwargs: Any):
@@ -263,7 +304,7 @@ class CodexResetNotifyPlugin(MaiBotPlugin):
             return False, "最近的 Codex 重置通知发送失败", True
 
         try:
-            reset_image = await self._capture_reset_image(snapshot.reset_at)
+            reset_image = await self._capture_reset_image(snapshot)
         except (OSError, PlaywrightError, ValueError) as exception:
             self.ctx.logger.error("/reset 指令生成主页重置截图失败: %s", exception, exc_info=True)
             failure_message = "重置时间已返回，但主页重置信息截图生成失败。"
@@ -325,41 +366,125 @@ class CodexResetNotifyPlugin(MaiBotPlugin):
             self._state = self._state_from_snapshot(snapshot, target_keys)
             self._save_state()
             if not self.config.plugin.notify_on_first_run:
-                self.ctx.logger.info("Codex 重置监控基线已建立: %s", snapshot.reset_at)
+                self.ctx.logger.info(
+                    "Codex 重置监控基线已建立: id=%s, time=%s",
+                    snapshot.reset_id,
+                    snapshot.reset_at,
+                )
                 return
-        elif self._parse_timestamp(self._state.reset_at) != self._parse_timestamp(snapshot.reset_at):
+        elif self._state.reset_id is None:
+            is_same_legacy_event = self._timestamps_within_tolerance(
+                self._state.reset_at,
+                snapshot.reset_at,
+                LEGACY_STATE_TIME_TOLERANCE_SECONDS,
+            )
+            if is_same_legacy_event:
+                legacy_state = self._state
+                self._state = MonitorState(
+                    reset_id=snapshot.reset_id,
+                    reset_at=snapshot.reset_at,
+                    source_url=snapshot.source_url,
+                    target_keys=legacy_state.target_keys,
+                    text_delivered_target_keys=legacy_state.text_delivered_target_keys,
+                    image_delivered_target_keys=legacy_state.image_delivered_target_keys,
+                )
+                self._save_state()
+                self.ctx.logger.info(
+                    "旧版重置状态已静默迁移: id=%s, time=%s",
+                    snapshot.reset_id,
+                    snapshot.reset_at,
+                )
+            else:
+                target_keys = [target.key for target in self._configured_targets()]
+                self._state = self._state_from_snapshot(snapshot, target_keys)
+                self._save_state()
+                self.ctx.logger.info(
+                    "状态迁移时发现新的 Codex 重置: id=%s, time=%s",
+                    snapshot.reset_id,
+                    snapshot.reset_at,
+                )
+        elif self._state.reset_id != snapshot.reset_id:
             target_keys = [target.key for target in self._configured_targets()]
             self._state = self._state_from_snapshot(snapshot, target_keys)
             self._save_state()
-            self.ctx.logger.info("Codex limit reset 时间已变化: %s", snapshot.reset_at)
+            self.ctx.logger.info(
+                "Codex limit reset 公告已变化: id=%s, time=%s",
+                snapshot.reset_id,
+                snapshot.reset_at,
+            )
+        elif self._state.reset_at != snapshot.reset_at or self._state.source_url != snapshot.source_url:
+            self._state.reset_at = snapshot.reset_at
+            self._state.source_url = snapshot.source_url
+            self._save_state()
+            self.ctx.logger.info("Codex 重置公告元数据已更新: id=%s", snapshot.reset_id)
 
         await self._deliver_pending_notifications()
 
     async def _fetch_latest_snapshot(self) -> ResetSnapshot:
-        """从公开 API 读取最新已确认重置时间。"""
-
-        forecast = await self._get_json(FORECAST_URL)
-        return self._snapshot_from_forecast(forecast)
-
-    async def _get_json(self, url: str) -> Dict[str, Any]:
-        """请求并校验 JSON 对象响应。"""
+        """从公开 API 读取最新的 regular 重置公告。"""
 
         if self._http_session is None:
             raise RuntimeError("HTTP 会话尚未初始化")
-        async with self._http_session.get(url) as response:
+
+        request_headers: Dict[str, str] = {}
+        if self._resets_etag is not None:
+            request_headers["If-None-Match"] = self._resets_etag
+
+        async with self._http_session.get(RESET_LIST_URL, headers=request_headers) as response:
+            if response.status == 304:
+                if self._cached_snapshot is None:
+                    raise ValueError("API 返回 304，但插件尚无可用的重置快照缓存")
+                return self._cached_snapshot
             response.raise_for_status()
             payload = await response.json(content_type=None)
         if not isinstance(payload, dict):
-            raise ValueError(f"{url} 返回的 JSON 顶层必须是对象")
-        return payload
+            raise ValueError(f"{RESET_LIST_URL} 返回的 JSON 顶层必须是对象")
+
+        snapshot = self._snapshot_from_reset_list(payload)
+        self._resets_etag = response.headers.get("ETag")
+        self._cached_snapshot = snapshot
+        return snapshot
 
     @classmethod
-    def _snapshot_from_forecast(cls, forecast: Dict[str, Any]) -> ResetSnapshot:
-        """从 forecast 中提取并校验最新重置时间。"""
+    def _snapshot_from_reset_list(cls, payload: Dict[str, Any]) -> ResetSnapshot:
+        """从公告列表中提取第一条普通重置并校验关键字段。"""
 
-        reset_at = cls._required_string(forecast, "last_reset_at", "forecast")
-        cls._parse_timestamp(reset_at)
-        return ResetSnapshot(reset_at=reset_at)
+        reset_items = payload.get("data")
+        if not isinstance(reset_items, list):
+            raise ValueError("resets.data 必须是列表")
+
+        for index, reset_item in enumerate(reset_items):
+            source_name = f"resets.data[{index}]"
+            if not isinstance(reset_item, dict):
+                raise ValueError(f"{source_name} 必须是对象")
+            reset_type = cls._required_string(reset_item, "reset_type", source_name)
+            if reset_type != "regular":
+                continue
+
+            reset_id = cls._required_string(reset_item, "id", source_name)
+            reset_at = cls._required_string(reset_item, "announced_at", source_name)
+            cls._required_string(reset_item, "text", source_name)
+            cls._parse_timestamp(reset_at)
+
+            source = reset_item.get("source")
+            if not isinstance(source, dict):
+                raise ValueError(f"{source_name}.source 必须是对象")
+            cls._required_string(source, "type", f"{source_name}.source")
+            source_url_value = source.get("url")
+            if source_url_value is None:
+                source_url = None
+            elif isinstance(source_url_value, str) and source_url_value.strip():
+                source_url = source_url_value.strip()
+            else:
+                raise ValueError(f"{source_name}.source.url 必须是非空字符串或 null")
+
+            return ResetSnapshot(
+                reset_id=reset_id,
+                reset_at=reset_at,
+                source_url=source_url,
+            )
+
+        raise ValueError(f"最近 {RESET_LIST_LIMIT} 条公告中没有 regular 重置")
 
     async def _deliver_pending_notifications(self) -> None:
         """向本次变化中尚未成功的目标依次投递文本和截图。"""
@@ -367,8 +492,9 @@ class CodexResetNotifyPlugin(MaiBotPlugin):
         if self._state is None:
             raise RuntimeError("监控状态尚未初始化")
 
+        snapshot = self._state.to_snapshot()
         configured_target_map = {target.key: target for target in self._configured_targets()}
-        message = self._build_notification_message(self._state.reset_at)
+        message = self._build_notification_message(snapshot.reset_at)
         resolved_stream_ids: Dict[str, str] = {}
         for target_key in self._state.target_keys:
             text_delivered = target_key in self._state.text_delivered_target_keys
@@ -408,7 +534,7 @@ class CodexResetNotifyPlugin(MaiBotPlugin):
             return
 
         try:
-            reset_image = await self._capture_reset_image(self._state.reset_at)
+            reset_image = await self._capture_reset_image(snapshot)
         except (OSError, PlaywrightError, ValueError) as exception:
             self.ctx.logger.error("Codex 主页重置信息截图生成失败: %s", exception, exc_info=True)
             return
@@ -426,8 +552,8 @@ class CodexResetNotifyPlugin(MaiBotPlugin):
             self._save_state()
             self.ctx.logger.info("Codex 重置图片已投递: target=%s", target_key)
 
-    async def _capture_reset_image(self, reset_at: str) -> str:
-        """使用 Chrome 打开主页并截取最新的正式重置公告。"""
+    async def _capture_reset_image(self, snapshot: ResetSnapshot) -> str:
+        """使用 Chrome 打开主页并截取 API 对应的普通重置公告。"""
 
         async with self._screenshot_lock:
             browser_executable = self._resolve_browser_executable()
@@ -449,40 +575,60 @@ class CodexResetNotifyPlugin(MaiBotPlugin):
                         color_scheme="light",
                     )
                     await page.goto(
-                        SCREENSHOT_SITE_URL,
+                        SITE_URL,
                         wait_until="domcontentloaded",
                         timeout=SCREENSHOT_TIMEOUT_MS,
                     )
                     await page.wait_for_timeout(SCREENSHOT_STABILIZE_MS)
                     await page.evaluate("() => document.fonts.ready")
 
-                    latest_announcement = page.locator(LATEST_RESET_ANNOUNCEMENT_SELECTOR).first
-                    await latest_announcement.wait_for(state="visible", timeout=SCREENSHOT_TIMEOUT_MS)
-
-                    rendered_announcement_at = await latest_announcement.locator(
-                        ANNOUNCEMENT_TIME_SELECTOR
-                    ).get_attribute("data-datetime")
-                    if not isinstance(rendered_announcement_at, str) or not rendered_announcement_at.strip():
-                        raise ValueError("截图网站的最新公告缺少 data-datetime")
-
-                    time_difference_seconds = abs(
-                        (
-                            self._parse_timestamp(rendered_announcement_at) - self._parse_timestamp(reset_at)
-                        ).total_seconds()
+                    announcement_items = page.locator(RESET_ANNOUNCEMENT_SELECTOR)
+                    target_index = await announcement_items.evaluate_all(
+                        """(announcements, target) => announcements.findIndex(announcement => {
+                            const marker = announcement.querySelector(target.selector);
+                            return marker?.getAttribute(target.attribute) === target.value;
+                        })""",
+                        {
+                            "selector": (
+                                ANNOUNCEMENT_LINK_SELECTOR
+                                if snapshot.source_url is not None
+                                else ANNOUNCEMENT_TIME_SELECTOR
+                            ),
+                            "attribute": "href" if snapshot.source_url is not None else "data-datetime",
+                            "value": snapshot.source_url if snapshot.source_url is not None else snapshot.reset_at,
+                        },
                     )
-                    if time_difference_seconds > SCREENSHOT_RESET_TIME_TOLERANCE_SECONDS:
+                    if target_index < 0:
                         raise ValueError(
-                            f"截图网站公告时间 {rendered_announcement_at} 与监控重置时间 {reset_at} "
-                            f"相差 {time_difference_seconds:.0f} 秒，超过允许范围"
+                            f"主页中未找到 API 公告: id={snapshot.reset_id}, "
+                            f"source_url={snapshot.source_url!r}, time={snapshot.reset_at}"
                         )
+                    target_announcement = announcement_items.nth(target_index)
+                    await target_announcement.wait_for(state="attached", timeout=SCREENSHOT_TIMEOUT_MS)
 
-                    avatar = latest_announcement.locator(ANNOUNCEMENT_AVATAR_SELECTOR)
+                    # 公告可能位于折叠历史中，截图前将它移入主列表并标记为唯一目标。
+                    await target_announcement.evaluate(
+                        f"""announcement => {{
+                            const section = announcement.closest('{ANNOUNCEMENT_SECTION_SELECTOR}');
+                            const primaryList = section?.querySelector(':scope > .log-list');
+                            if (!primaryList) {{
+                                throw new Error('公告区缺少主列表');
+                            }}
+                            announcement.setAttribute('{ANNOUNCEMENT_TARGET_ATTRIBUTE}', '');
+                            if (announcement.parentElement !== primaryList) {{
+                                primaryList.prepend(announcement);
+                            }}
+                        }}"""
+                    )
+                    await target_announcement.wait_for(state="visible", timeout=SCREENSHOT_TIMEOUT_MS)
+
+                    avatar = target_announcement.locator(ANNOUNCEMENT_AVATAR_SELECTOR)
                     await avatar.wait_for(state="visible", timeout=SCREENSHOT_TIMEOUT_MS)
                     await avatar.evaluate("image => image.decode()")
 
                     # 用持久样式隐藏其他帖子，避免网站定时更新 DOM 后将它们重新显示。
                     await page.add_style_tag(content=ANNOUNCEMENT_CROP_STYLE)
-                    await latest_announcement.wait_for(state="visible", timeout=SCREENSHOT_TIMEOUT_MS)
+                    await target_announcement.wait_for(state="visible", timeout=SCREENSHOT_TIMEOUT_MS)
                     await page.wait_for_timeout(100)
 
                     announcement_section = page.locator(ANNOUNCEMENT_SECTION_SELECTOR)
@@ -557,7 +703,9 @@ class CodexResetNotifyPlugin(MaiBotPlugin):
         """为新发现的重置创建待投递状态。"""
 
         return MonitorState(
+            reset_id=snapshot.reset_id,
             reset_at=snapshot.reset_at,
+            source_url=snapshot.source_url,
             target_keys=list(dict.fromkeys(target_keys)),
             text_delivered_target_keys=set(),
             image_delivered_target_keys=set(),
@@ -592,6 +740,13 @@ class CodexResetNotifyPlugin(MaiBotPlugin):
         if parsed.tzinfo is None:
             raise ValueError(f"重置时间缺少时区: {timestamp}")
         return parsed
+
+    @classmethod
+    def _timestamps_within_tolerance(cls, first: str, second: str, tolerance_seconds: int) -> bool:
+        """判断两个带时区的时间戳是否在允许偏差内。"""
+
+        difference_seconds = abs((cls._parse_timestamp(first) - cls._parse_timestamp(second)).total_seconds())
+        return difference_seconds <= tolerance_seconds
 
     @property
     def _state_path(self) -> Path:

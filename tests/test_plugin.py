@@ -2,7 +2,7 @@
 
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any, Dict, List
 
 import asyncio
@@ -26,22 +26,41 @@ def _load_plugin_module() -> ModuleType:
 plugin_module = _load_plugin_module()
 
 
-def test_snapshot_from_forecast_only_uses_latest_reset_time() -> None:
-    """快照只需要 forecast 中的最新重置时间。"""
+def test_snapshot_from_reset_list_selects_latest_regular_reset() -> None:
+    """快照跳过 banked 公告，选取最新的 regular 重置。"""
 
-    forecast: Dict[str, Any] = {
-        "last_reset_at": "2026-08-31T02:34:27.000Z",
-        "latest_alert": {
-            "id": "reset-1",
-            "kind": "reset",
-            "source_at": "2026-08-31T02:34:27Z",
-            "summary": "Usage reset for all paid Codex users.",
-        },
+    reset_list: Dict[str, Any] = {
+        "data": [
+            {
+                "id": "banked-1",
+                "reset_type": "banked",
+                "announced_at": "2026-09-01T00:00:00.000Z",
+                "text": "Banked reset.",
+                "source": {
+                    "type": "observed",
+                    "url": None,
+                },
+            },
+            {
+                "id": "2094251180121854309",
+                "reset_type": "regular",
+                "announced_at": "2026-08-31T02:29:25.000Z",
+                "text": "Usage reset for all paid Codex users.",
+                "source": {
+                    "type": "x_post",
+                    "url": "https://x.com/thsottiaux/status/2094251180121854309",
+                },
+            },
+        ]
     }
 
-    snapshot = plugin_module.CodexResetNotifyPlugin._snapshot_from_forecast(forecast)
+    snapshot = plugin_module.CodexResetNotifyPlugin._snapshot_from_reset_list(reset_list)
 
-    assert snapshot == plugin_module.ResetSnapshot(reset_at="2026-08-31T02:34:27.000Z")
+    assert snapshot == plugin_module.ResetSnapshot(
+        reset_id="2094251180121854309",
+        reset_at="2026-08-31T02:29:25.000Z",
+        source_url="https://x.com/thsottiaux/status/2094251180121854309",
+    )
 
 
 def test_notification_message_has_utc_and_beijing_times() -> None:
@@ -58,7 +77,9 @@ def test_monitor_state_round_trip() -> None:
     """状态文件保留逐目标投递结果。"""
 
     state = plugin_module.MonitorState(
+        reset_id="2094251180121854309",
         reset_at="2026-08-31T02:34:27.000Z",
+        source_url="https://x.com/thsottiaux/status/2094251180121854309",
         target_keys=["group:10001", "private:20002"],
         text_delivered_target_keys={"group:10001"},
         image_delivered_target_keys=set(),
@@ -84,8 +105,10 @@ def test_monitor_state_reads_legacy_announcement_fields() -> None:
     restored = plugin_module.MonitorState.from_dict(legacy_state)
 
     assert restored.to_dict() == {
-        "version": 3,
+        "version": 4,
+        "reset_id": None,
         "reset_at": "2026-08-31T02:34:27.000Z",
+        "source_url": None,
         "target_keys": ["group:10001"],
         "text_delivered_target_keys": ["group:10001"],
         "image_delivered_target_keys": ["group:10001"],
@@ -99,6 +122,97 @@ def test_equivalent_timestamp_formats_are_the_same_instant() -> None:
     timestamp_without_milliseconds = plugin_module.CodexResetNotifyPlugin._parse_timestamp("2026-08-31T02:34:27Z")
 
     assert timestamp_with_milliseconds == timestamp_without_milliseconds
+
+
+def test_legacy_state_migrates_without_resetting_delivery_progress() -> None:
+    """旧站点的同一公告迁移后保留已有的逐目标投递进度。"""
+
+    async def run_scan():
+        plugin = plugin_module.CodexResetNotifyPlugin()
+        plugin._ctx = SimpleNamespace(logger=logging.getLogger("test.codex_reset_notify.migration"))
+        plugin._state = plugin_module.MonitorState(
+            reset_id=None,
+            reset_at="2026-08-31T02:34:27.000Z",
+            source_url=None,
+            target_keys=["group:10001"],
+            text_delivered_target_keys={"group:10001"},
+            image_delivered_target_keys={"group:10001"},
+        )
+        latest_snapshot = plugin_module.ResetSnapshot(
+            reset_id="2094251180121854309",
+            reset_at="2026-08-31T02:29:25.000Z",
+            source_url="https://x.com/thsottiaux/status/2094251180121854309",
+        )
+        delivery_called = False
+
+        async def fetch_snapshot():
+            return latest_snapshot
+
+        async def deliver_notifications():
+            nonlocal delivery_called
+            delivery_called = True
+
+        plugin._fetch_latest_snapshot = fetch_snapshot
+        plugin._deliver_pending_notifications = deliver_notifications
+        plugin._save_state = lambda: None
+
+        await plugin._scan_once()
+        return plugin._state, delivery_called
+
+    state, delivery_called = asyncio.run(run_scan())
+
+    assert state == plugin_module.MonitorState(
+        reset_id="2094251180121854309",
+        reset_at="2026-08-31T02:29:25.000Z",
+        source_url="https://x.com/thsottiaux/status/2094251180121854309",
+        target_keys=["group:10001"],
+        text_delivered_target_keys={"group:10001"},
+        image_delivered_target_keys={"group:10001"},
+    )
+    assert delivery_called is True
+
+
+def test_new_reset_is_detected_by_id_even_when_time_is_unchanged() -> None:
+    """公告 ID 改变时必须通知，不依赖时间字符串是否改变。"""
+
+    async def run_scan():
+        plugin = plugin_module.CodexResetNotifyPlugin()
+        plugin._ctx = SimpleNamespace(logger=logging.getLogger("test.codex_reset_notify.new_id"))
+        plugin._state = plugin_module.MonitorState(
+            reset_id="reset-old",
+            reset_at="2026-08-31T02:29:25.000Z",
+            source_url="https://x.com/example/status/reset-old",
+            target_keys=[],
+            text_delivered_target_keys=set(),
+            image_delivered_target_keys=set(),
+        )
+        latest_snapshot = plugin_module.ResetSnapshot(
+            reset_id="reset-new",
+            reset_at="2026-08-31T02:29:25.000Z",
+            source_url="https://x.com/example/status/reset-new",
+        )
+        delivery_called = False
+
+        async def fetch_snapshot():
+            return latest_snapshot
+
+        async def deliver_notifications():
+            nonlocal delivery_called
+            delivery_called = True
+
+        plugin._fetch_latest_snapshot = fetch_snapshot
+        plugin._configured_targets = lambda: [plugin_module.NotificationTarget(chat_type="group", target_id="10001")]
+        plugin._deliver_pending_notifications = deliver_notifications
+        plugin._save_state = lambda: None
+
+        await plugin._scan_once()
+        return plugin._state, delivery_called
+
+    state, delivery_called = asyncio.run(run_scan())
+
+    assert state.reset_id == "reset-new"
+    assert state.target_keys == ["group:10001"]
+    assert delivery_called is True
 
 
 def test_reset_command_fetches_and_sends_latest_notification() -> None:
@@ -128,10 +242,14 @@ def test_reset_command_fetches_and_sends_latest_notification() -> None:
         plugin._ctx = fake_context
 
         async def fetch_snapshot():
-            return plugin_module.ResetSnapshot(reset_at="2026-08-31T02:34:27.000Z")
+            return plugin_module.ResetSnapshot(
+                reset_id="2094251180121854309",
+                reset_at="2026-08-31T02:34:27.000Z",
+                source_url="https://x.com/thsottiaux/status/2094251180121854309",
+            )
 
-        async def capture_reset_image(reset_at: str):
-            events.append(("capture", reset_at))
+        async def capture_reset_image(snapshot):
+            events.append(("capture", snapshot))
             return "reset-image-base64"
 
         plugin._fetch_latest_snapshot = fetch_snapshot
@@ -149,7 +267,14 @@ def test_reset_command_fetches_and_sends_latest_notification() -> None:
             "最新的codex额度重置时间：2026-08-31 10:34:27 北京时间",
             "stream-1",
         ),
-        ("capture", "2026-08-31T02:34:27.000Z"),
+        (
+            "capture",
+            plugin_module.ResetSnapshot(
+                reset_id="2094251180121854309",
+                reset_at="2026-08-31T02:34:27.000Z",
+                source_url="https://x.com/thsottiaux/status/2094251180121854309",
+            ),
+        ),
         ("image", "reset-image-base64", "stream-1"),
     ]
 
@@ -179,7 +304,9 @@ def test_automatic_notification_retries_only_failed_image() -> None:
         plugin = plugin_module.CodexResetNotifyPlugin()
         plugin._ctx = FakeContext(events)
         plugin._state = plugin_module.MonitorState(
+            reset_id="2094251180121854309",
             reset_at="2026-08-31T02:34:27.000Z",
+            source_url="https://x.com/thsottiaux/status/2094251180121854309",
             target_keys=["group:10001"],
             text_delivered_target_keys=set(),
             image_delivered_target_keys=set(),
@@ -193,10 +320,10 @@ def test_automatic_notification_retries_only_failed_image() -> None:
 
         screenshot_attempt = 0
 
-        async def capture_reset_image(reset_at: str):
+        async def capture_reset_image(snapshot):
             nonlocal screenshot_attempt
             screenshot_attempt += 1
-            events.append(("capture", screenshot_attempt, reset_at))
+            events.append(("capture", screenshot_attempt, snapshot))
             if screenshot_attempt == 1:
                 raise ValueError("模拟截图失败")
             return "reset-image-base64"
@@ -225,8 +352,24 @@ def test_automatic_notification_retries_only_failed_image() -> None:
             "最新的codex额度重置时间：2026-08-31 10:34:27 北京时间",
             "stream-1",
         ),
-        ("capture", 1, "2026-08-31T02:34:27.000Z"),
-        ("capture", 2, "2026-08-31T02:34:27.000Z"),
+        (
+            "capture",
+            1,
+            plugin_module.ResetSnapshot(
+                reset_id="2094251180121854309",
+                reset_at="2026-08-31T02:34:27.000Z",
+                source_url="https://x.com/thsottiaux/status/2094251180121854309",
+            ),
+        ),
+        (
+            "capture",
+            2,
+            plugin_module.ResetSnapshot(
+                reset_id="2094251180121854309",
+                reset_at="2026-08-31T02:34:27.000Z",
+                source_url="https://x.com/thsottiaux/status/2094251180121854309",
+            ),
+        ),
         ("image", "reset-image-base64", "stream-1"),
     ]
     assert first_state == ({"group:10001"}, set())
