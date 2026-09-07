@@ -54,7 +54,7 @@ SCREENSHOT_VIEWPORT_HEIGHT = 1_000
 LEGACY_STATE_TIME_TOLERANCE_SECONDS = 15 * 60
 STATE_FILE_NAME = "state.json"
 STATE_VERSION = 4
-USER_AGENT = "MaiBot-Codex-Reset-Notify-Plugin/1.4.0"
+USER_AGENT = "MaiBot-Codex-Reset-Notify-Plugin/1.4.1"
 BEIJING_TIMEZONE = ZoneInfo("Asia/Shanghai")
 BROWSER_EXECUTABLE_NAMES = (
     "google-chrome",
@@ -66,7 +66,7 @@ BROWSER_EXECUTABLE_NAMES = (
 
 @dataclass(frozen=True)
 class ResetSnapshot:
-    """codex-resets.com 上最新的普通重置信息。"""
+    """codex-resets.com 上最新的重置信息。"""
 
     reset_id: str
     reset_at: str
@@ -421,7 +421,7 @@ class CodexResetNotifyPlugin(MaiBotPlugin):
         await self._deliver_pending_notifications()
 
     async def _fetch_latest_snapshot(self) -> ResetSnapshot:
-        """从公开 API 读取最新的 regular 重置公告。"""
+        """从公开 API 读取最新重置公告。"""
 
         if self._http_session is None:
             raise RuntimeError("HTTP 会话尚未初始化")
@@ -447,44 +447,43 @@ class CodexResetNotifyPlugin(MaiBotPlugin):
 
     @classmethod
     def _snapshot_from_reset_list(cls, payload: Dict[str, Any]) -> ResetSnapshot:
-        """从公告列表中提取第一条普通重置并校验关键字段。"""
+        """从按时间降序的公告列表中提取最新重置。"""
 
         reset_items = payload.get("data")
         if not isinstance(reset_items, list):
             raise ValueError("resets.data 必须是列表")
+        if not reset_items:
+            raise ValueError("resets.data 中没有重置公告")
 
-        for index, reset_item in enumerate(reset_items):
-            source_name = f"resets.data[{index}]"
-            if not isinstance(reset_item, dict):
-                raise ValueError(f"{source_name} 必须是对象")
-            reset_type = cls._required_string(reset_item, "reset_type", source_name)
-            if reset_type != "regular":
-                continue
+        reset_item = reset_items[0]
+        source_name = "resets.data[0]"
+        if not isinstance(reset_item, dict):
+            raise ValueError(f"{source_name} 必须是对象")
 
-            reset_id = cls._required_string(reset_item, "id", source_name)
-            reset_at = cls._required_string(reset_item, "announced_at", source_name)
-            cls._required_string(reset_item, "text", source_name)
-            cls._parse_timestamp(reset_at)
+        # banked 也是网站正式的额度重置类型，不应跳过。
+        cls._required_string(reset_item, "reset_type", source_name)
+        reset_id = cls._required_string(reset_item, "id", source_name)
+        reset_at = cls._required_string(reset_item, "announced_at", source_name)
+        cls._required_string(reset_item, "text", source_name)
+        cls._parse_timestamp(reset_at)
 
-            source = reset_item.get("source")
-            if not isinstance(source, dict):
-                raise ValueError(f"{source_name}.source 必须是对象")
-            cls._required_string(source, "type", f"{source_name}.source")
-            source_url_value = source.get("url")
-            if source_url_value is None:
-                source_url = None
-            elif isinstance(source_url_value, str) and source_url_value.strip():
-                source_url = source_url_value.strip()
-            else:
-                raise ValueError(f"{source_name}.source.url 必须是非空字符串或 null")
+        source = reset_item.get("source")
+        if not isinstance(source, dict):
+            raise ValueError(f"{source_name}.source 必须是对象")
+        cls._required_string(source, "type", f"{source_name}.source")
+        source_url_value = source.get("url")
+        if source_url_value is None:
+            source_url = None
+        elif isinstance(source_url_value, str) and source_url_value.strip():
+            source_url = source_url_value.strip()
+        else:
+            raise ValueError(f"{source_name}.source.url 必须是非空字符串或 null")
 
-            return ResetSnapshot(
-                reset_id=reset_id,
-                reset_at=reset_at,
-                source_url=source_url,
-            )
-
-        raise ValueError(f"最近 {RESET_LIST_LIMIT} 条公告中没有 regular 重置")
+        return ResetSnapshot(
+            reset_id=reset_id,
+            reset_at=reset_at,
+            source_url=source_url,
+        )
 
     async def _deliver_pending_notifications(self) -> None:
         """向本次变化中尚未成功的目标依次投递文本和截图。"""
@@ -553,7 +552,7 @@ class CodexResetNotifyPlugin(MaiBotPlugin):
             self.ctx.logger.info("Codex 重置图片已投递: target=%s", target_key)
 
     async def _capture_reset_image(self, snapshot: ResetSnapshot) -> str:
-        """使用 Chrome 打开主页并截取 API 对应的普通重置公告。"""
+        """使用 Chrome 打开主页并截取 API 对应的重置公告。"""
 
         async with self._screenshot_lock:
             browser_executable = self._resolve_browser_executable()

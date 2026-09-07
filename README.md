@@ -1,6 +1,6 @@
 # Codex 额度重置通知插件
 
-该插件每 5 分钟读取一次 `https://codex-resets.com/api/v1/resets?limit=20&order=desc`，并选取最新的 `regular` 重置公告。当公告 `id` 发生变化时，插件会同时显示 API 中的 UTC 时间和转换后的北京时间：
+该插件每 5 分钟读取一次 `https://codex-resets.com/api/v1/resets?limit=20&order=desc`，并选取列表中最新的重置公告（包括 `regular` 和 `banked`）。当公告 `id` 发生变化时，插件会同时显示 API 中的 UTC 时间和转换后的北京时间：
 
 ```text
 Latest Codex limit reset：2026-08-31 02:29:25 UTC

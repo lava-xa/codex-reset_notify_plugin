@@ -26,8 +26,8 @@ def _load_plugin_module() -> ModuleType:
 plugin_module = _load_plugin_module()
 
 
-def test_snapshot_from_reset_list_selects_latest_regular_reset() -> None:
-    """快照跳过 banked 公告，选取最新的 regular 重置。"""
+def test_snapshot_from_reset_list_selects_latest_banked_reset() -> None:
+    """最新公告是 banked 时不能跳过它去返回旧的 regular 重置。"""
 
     reset_list: Dict[str, Any] = {
         "data": [
@@ -37,8 +37,8 @@ def test_snapshot_from_reset_list_selects_latest_regular_reset() -> None:
                 "announced_at": "2026-09-01T00:00:00.000Z",
                 "text": "Banked reset.",
                 "source": {
-                    "type": "observed",
-                    "url": None,
+                    "type": "x_post",
+                    "url": "https://x.com/thsottiaux/status/banked-1",
                 },
             },
             {
@@ -57,9 +57,9 @@ def test_snapshot_from_reset_list_selects_latest_regular_reset() -> None:
     snapshot = plugin_module.CodexResetNotifyPlugin._snapshot_from_reset_list(reset_list)
 
     assert snapshot == plugin_module.ResetSnapshot(
-        reset_id="2094251180121854309",
-        reset_at="2026-08-31T02:29:25.000Z",
-        source_url="https://x.com/thsottiaux/status/2094251180121854309",
+        reset_id="banked-1",
+        reset_at="2026-09-01T00:00:00.000Z",
+        source_url="https://x.com/thsottiaux/status/banked-1",
     )
 
 
