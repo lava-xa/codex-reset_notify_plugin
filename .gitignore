@@ -1,3 +1,19 @@
 __pycache__/
 .pytest_cache/
 *.py[cod]
+.ruff_cache/
+.venv/
+.coverage
+htmlcov/
+
+# 运行配置、备份及状态仅保存在安装实例，不随源码发布。
+/config.toml
+/config_back/
+*.backup.*
+/state.json
+/state.json.tmp
+
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

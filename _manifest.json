@@ -1,27 +1,27 @@
 {
   "manifest_version": 2,
-  "version": "1.4.1",
+  "version": "1.4.2",
   "name": "Codex 额度重置通知",
   "description": "每五分钟监控 codex-resets.com，并将新的 Codex 额度重置与对应公告截图发送到 QQ 白名单。",
   "author": {
     "name": "lava",
-    "url": "https://github.com/lava-xa/codex-reset_notify_plugin"
+    "url": "https://github.com/lava-xa"
   },
-  "license": "GPL-v3.0-or-later",
+  "license": "GPL-3.0-or-later",
   "urls": {
     "repository": "https://github.com/lava-xa/codex-reset_notify_plugin",
-    "homepage": "https://codex-resets.com/",
-    "documentation": "https://github.com/lava-xa/codex-reset_notify_plugin",
-    "issues": "https://github.com/lava-xa/codex-reset_notify_plugin"
+    "homepage": "https://github.com/lava-xa/codex-reset_notify_plugin",
+    "documentation": "https://github.com/lava-xa/codex-reset_notify_plugin/blob/main/README.md",
+    "issues": "https://github.com/lava-xa/codex-reset_notify_plugin/issues"
   },
   "changelog": "CHANGELOG.md",
   "host_application": {
     "min_version": "1.0.0",
-    "max_version": "1.99.99"
+    "max_version": "1.3.99"
   },
   "sdk": {
-    "min_version": "2.0.0",
-    "max_version": "2.99.99"
+    "min_version": "2.8.0",
+    "max_version": "2.20.99"
   },
   "dependencies": [
     {
@@ -35,6 +35,13 @@
       "version_spec": ">=1.54.0"
     }
   ],
+  "plugin_type": "automation",
+  "display": {
+    "icon": {
+      "type": "lucide",
+      "value": "bell-ring"
+    }
+  },
   "capabilities": [
     "send.text",
     "send.image",

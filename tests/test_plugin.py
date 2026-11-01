@@ -6,8 +6,13 @@ from types import ModuleType, SimpleNamespace
 from typing import Any, Dict, List
 
 import asyncio
+import inspect
 import logging
 import sys
+import tomllib
+
+from maibot_sdk import MaiBotPlugin
+from maibot_sdk.context import PluginContext, PluginPaths
 
 
 def _load_plugin_module() -> ModuleType:
@@ -24,6 +29,116 @@ def _load_plugin_module() -> ModuleType:
 
 
 plugin_module = _load_plugin_module()
+
+
+def test_sdk_factory_lifecycle_and_command_contract() -> None:
+    """真实 SDK 能发现入口、生命周期、命令和插件路径接口。"""
+
+    plugin = plugin_module.create_plugin()
+    assert isinstance(plugin, MaiBotPlugin)
+    for method_name in ("on_load", "on_unload", "on_config_update"):
+        assert inspect.iscoroutinefunction(getattr(plugin, method_name))
+        assert getattr(type(plugin), method_name) is not getattr(MaiBotPlugin, method_name)
+    assert plugin.get_config_reload_subscriptions() == []
+    assert isinstance(PluginContext("codex-reset.notify-plugin").paths.data_dir, Path)
+    components = plugin.get_components()
+    assert len(components) == 1
+    assert components[0]["type"] == "COMMAND"
+    assert components[0]["metadata"]["command_pattern"] == r"^/reset$"
+
+
+def test_config_example_matches_sdk_defaults_and_generates_schema() -> None:
+    """示例可经 SDK 注入，默认不向任何目标发送通知。"""
+
+    example_path = Path(__file__).resolve().parents[1] / "config.example.toml"
+    example = tomllib.loads(example_path.read_text(encoding="utf-8"))
+    plugin = plugin_module.create_plugin()
+    plugin.set_plugin_config(example)
+    assert plugin.get_plugin_config_data() == plugin.build_default_config()
+    assert plugin._configured_targets() == []
+    schema = plugin.build_config_schema(plugin_id="codex-reset.notify-plugin")
+    assert schema["sections"]["whitelist"]["fields"]["group_whitelist"]["item_type"] == "string"
+
+
+def test_stream_lookup_uses_real_sdk_response_normalization() -> None:
+    """验证 Host 包装结果经过 SDK 解包后能解析群聊及私聊流。"""
+
+    async def run_lookups():
+        calls = []
+
+        async def rpc_call(method, plugin_id, payload):
+            assert method == "cap.call"
+            assert plugin_id == "codex-reset.notify-plugin"
+            calls.append(payload)
+            target_id = payload["args"].get("group_id") or payload["args"].get("user_id")
+            return {
+                "success": True,
+                "stream": None if target_id == "missing" else {"session_id": f"stream-{target_id}"},
+            }
+
+        plugin = plugin_module.create_plugin()
+        plugin._ctx = PluginContext("codex-reset.notify-plugin", rpc_call=rpc_call)
+        assert await plugin._resolve_stream_id(plugin_module.NotificationTarget("group", "10001")) == "stream-10001"
+        assert await plugin._resolve_stream_id(plugin_module.NotificationTarget("private", "20002")) == "stream-20002"
+        assert await plugin._resolve_stream_id(plugin_module.NotificationTarget("group", "missing")) is None
+        return calls
+
+    calls = asyncio.run(run_lookups())
+    assert calls[0] == {
+        "capability": "chat.get_stream_by_group_id",
+        "args": {"group_id": "10001", "platform": "qq"},
+    }
+    assert calls[1] == {
+        "capability": "chat.get_stream_by_user_id",
+        "args": {"user_id": "20002", "platform": "qq"},
+    }
+
+
+def test_lifecycle_hot_update_stops_monitor_and_closes_session(tmp_path) -> None:
+    """真实配置更新与卸载会取消后台任务、关闭会话并使用分配的数据目录。"""
+
+    async def run_lifecycle():
+        plugin = plugin_module.create_plugin()
+        plugin._ctx = PluginContext("codex-reset.notify-plugin", paths=PluginPaths(
+            data_dir=tmp_path / "data", runtime_dir=tmp_path / "runtime",
+        ))
+        config = plugin.build_default_config()
+        config["plugin"]["enabled"] = False
+        plugin.set_plugin_config(config)
+
+        async def idle_monitor():
+            await asyncio.Event().wait()
+
+        # 仅隔离自动轮询，生命周期和 SDK 配置注入走真实实现。
+        plugin._monitor_loop = idle_monitor
+        await plugin.on_load()
+        session = plugin._http_session
+        try:
+            assert plugin._state_path == tmp_path / "data" / "state.json"
+            assert plugin._state_path.parent.is_dir()
+            assert session is not None and not session.closed
+            assert plugin._monitor_task is None
+
+            config["plugin"]["enabled"] = True
+            plugin.set_plugin_config(config)
+            await plugin.on_config_update("self", config, "1.0.0")
+            monitor_task = plugin._monitor_task
+            assert monitor_task is not None
+            await asyncio.sleep(0)
+            await plugin.on_config_update("bot", {}, "1.0.0")
+            assert plugin._monitor_task is monitor_task
+
+            config["plugin"]["enabled"] = False
+            plugin.set_plugin_config(config)
+            await plugin.on_config_update("self", config, "1.0.0")
+            assert plugin._monitor_task is None
+            assert monitor_task.cancelled()
+        finally:
+            await plugin.on_unload()
+        assert session.closed
+        assert plugin._http_session is None
+
+    asyncio.run(run_lifecycle())
 
 
 def test_snapshot_from_reset_list_selects_latest_banked_reset() -> None:

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Codex 额度重置通知插件。"""
 
 from contextlib import suppress
@@ -54,7 +55,7 @@ SCREENSHOT_VIEWPORT_HEIGHT = 1_000
 LEGACY_STATE_TIME_TOLERANCE_SECONDS = 15 * 60
 STATE_FILE_NAME = "state.json"
 STATE_VERSION = 4
-USER_AGENT = "MaiBot-Codex-Reset-Notify-Plugin/1.4.1"
+USER_AGENT = "MaiBot-Codex-Reset-Notify-Plugin/1.4.2"
 BEIJING_TIMEZONE = ZoneInfo("Asia/Shanghai")
 BROWSER_EXECUTABLE_NAMES = (
     "google-chrome",

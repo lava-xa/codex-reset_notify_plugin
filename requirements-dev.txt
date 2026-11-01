@@ -1,0 +1,6 @@
+# 仅供独立开发 / 测试；生产环境由 MaiBot 根据 manifest 安装依赖。
+maibot-plugin-sdk>=2.8.0,<2.21.0
+aiohttp>=3.12.14
+playwright>=1.54.0
+pytest>=8.0
+ruff>=0.12.2
