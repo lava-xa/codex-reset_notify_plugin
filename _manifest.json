@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "version": "1.4.2",
+  "version": "1.1.2",
   "name": "Codex 额度重置通知",
   "description": "每五分钟监控 codex-resets.com，并将新的 Codex 额度重置与对应公告截图发送到 QQ 白名单。",
   "author": {
