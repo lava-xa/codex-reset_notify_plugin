@@ -61,11 +61,68 @@ def test_config_example_matches_sdk_defaults_and_generates_schema() -> None:
     assert plugin.get_plugin_config_data() == plugin.build_default_config()
     assert plugin._configured_targets() == []
     schema = plugin.build_config_schema(plugin_id="codex-reset.notify-plugin")
-    assert schema["sections"]["whitelist"]["fields"]["group_whitelist"]["item_type"] == "string"
-    reset_switch = schema["sections"]["whitelist"]["fields"]["group_only_reset"]
+    whitelist_fields = schema["sections"]["whitelist"]["fields"]
+    assert "group_only_reset" not in whitelist_fields
+    group_field = whitelist_fields["group_whitelist"]
+    assert group_field["item_type"] == "object"
+    assert group_field["item_fields"]["group_id"]["type"] == "string"
+    reset_switch = group_field["item_fields"]["only_reset"]
     assert reset_switch["type"] == "boolean"
     assert reset_switch["default"] is False
-    assert reset_switch["ui_type"] == "switch"
+    assert reset_switch["label"] == "仅接受 /reset"
+
+
+@pytest.mark.parametrize("legacy_flag", [None, False, True])
+def test_legacy_group_whitelist_migrates_without_changing_settings(legacy_flag: Optional[bool]) -> None:
+    """原群号及共用开关转换成逐群条目，新条目保留独立设置，归一化不会修改输入。"""
+
+    plugin = plugin_module.create_plugin()
+    config = plugin.build_default_config()
+    config["plugin"]["config_version"] = "1.0.0" if legacy_flag is None else "1.1.0"
+    config["whitelist"]["group_whitelist"] = [
+        "10001", "10002", {"group_id": "10003", "only_reset": False},
+    ]
+    if legacy_flag is not None:
+        config["whitelist"]["group_only_reset"] = legacy_flag
+    plugin.set_plugin_config(config)
+    normalized = plugin.get_plugin_config_data()
+    assert normalized["whitelist"]["group_whitelist"] == [
+        {"group_id": "10001", "only_reset": legacy_flag is True},
+        {"group_id": "10002", "only_reset": legacy_flag is True},
+        {"group_id": "10003", "only_reset": False},
+    ]
+    assert "group_only_reset" not in normalized["whitelist"]
+    assert config["whitelist"]["group_whitelist"][0] == "10001"
+    assert plugin.normalize_plugin_config(normalized) == (normalized, False)
+
+
+def test_group_switches_are_independent_and_notifications_keep_all_targets() -> None:
+    """同一白名单中，开启的群忽略普通消息，关闭的群正常处理，全部群仍接收通知。"""
+
+    async def run_filters():
+        plugin = plugin_module.create_plugin()
+        config = plugin.build_default_config()
+        config["whitelist"]["group_whitelist"] = [
+            {"group_id": "10001", "only_reset": True},
+            {"group_id": "10002", "only_reset": False},
+            {"group_id": "10003"},
+        ]
+        config["whitelist"]["private_whitelist"] = ["20001"]
+        plugin.set_plugin_config(config)
+        for group_id, expected_action in (("10001", "abort"), ("10002", "continue"), ("10003", "continue")):
+            message = {
+                "platform": "qq",
+                "message_info": {"group_info": {"group_id": group_id}},
+                "raw_message": [{"type": "text", "data": "你好"}],
+            }
+            assert (await plugin.filter_group_messages(message))["action"] == expected_action
+            message["raw_message"] = [{"type": "text", "data": "/reset"}]
+            assert (await plugin.filter_group_messages(message))["action"] == "continue"
+        assert [target.key for target in plugin._configured_targets()] == [
+            "group:10001", "group:10002", "group:10003", "private:20001",
+        ]
+
+    asyncio.run(run_filters())
 
 
 @pytest.mark.parametrize(
@@ -100,7 +157,7 @@ def test_group_only_reset_filters_inbound_message_types(
 
     plugin = plugin_module.create_plugin()
     config = plugin.build_default_config()
-    config["whitelist"].update(group_whitelist=["10001"], group_only_reset=True)
+    config["whitelist"]["group_whitelist"] = [{"group_id": "10001", "only_reset": True}]
     plugin.set_plugin_config(config)
     message = {
         "platform": "qq",
@@ -129,7 +186,7 @@ def test_group_only_reset_filters_inbound_message_types(
         (True, True, "telegram", "10001", ["10001"], "continue"),
     ],
 )
-def test_group_only_reset_respects_scope_and_legacy_config(
+def test_group_only_reset_respects_scope_and_defaults(
     enabled: bool,
     only_reset: Optional[bool],
     platform: str,
@@ -137,17 +194,15 @@ def test_group_only_reset_respects_scope_and_legacy_config(
     groups: List[str],
     expected_action: str,
 ) -> None:
-    """禁用插件、旧配置、其他群、私聊和其他平台保持原有处理流程。"""
+    """禁用插件、默认关闭的群、其他群、私聊和其他平台保持原有处理流程。"""
 
     plugin = plugin_module.create_plugin()
     config = plugin.build_default_config()
     config["plugin"]["enabled"] = enabled
-    config["whitelist"]["group_whitelist"] = groups
-    if only_reset is not None:
-        config["whitelist"]["group_only_reset"] = only_reset
-    else:
-        config["plugin"]["config_version"] = "1.0.0"
-        del config["whitelist"]["group_only_reset"]
+    config["whitelist"]["group_whitelist"] = [
+        {"group_id": group_id, "only_reset": only_reset} if only_reset is not None else {"group_id": group_id}
+        for group_id in groups
+    ]
     plugin.set_plugin_config(config)
     message = {
         "platform": platform,
@@ -163,7 +218,7 @@ def test_group_only_reset_does_not_treat_notice_text_as_command() -> None:
 
     plugin = plugin_module.create_plugin()
     config = plugin.build_default_config()
-    config["whitelist"].update(group_whitelist=["10001"], group_only_reset=True)
+    config["whitelist"]["group_whitelist"] = [{"group_id": "10001", "only_reset": True}]
     plugin.set_plugin_config(config)
     result = asyncio.run(plugin.filter_group_messages({
         "platform": "qq",
@@ -218,8 +273,10 @@ def test_lifecycle_hot_update_stops_monitor_and_closes_session(tmp_path) -> None
         ))
         config = plugin.build_default_config()
         config["plugin"]["enabled"] = False
-        config["whitelist"]["group_whitelist"] = ["10001"]
-        config["whitelist"]["group_only_reset"] = True
+        config["whitelist"]["group_whitelist"] = [
+            {"group_id": "10001", "only_reset": True},
+            {"group_id": "10002", "only_reset": False},
+        ]
         plugin.set_plugin_config(config)
         message = {
             "platform": "qq",
@@ -251,13 +308,12 @@ def test_lifecycle_hot_update_stops_monitor_and_closes_session(tmp_path) -> None
             assert plugin._monitor_task is monitor_task
             assert (await plugin.filter_group_messages(message))["action"] == "abort"
 
-            config["whitelist"]["group_only_reset"] = False
+            config["whitelist"]["group_whitelist"][0]["only_reset"] = False
             plugin.set_plugin_config(config)
             await plugin.on_config_update("self", config, "1.1.0")
             assert (await plugin.filter_group_messages(message))["action"] == "continue"
 
-            config["whitelist"]["group_only_reset"] = True
-            config["whitelist"]["group_whitelist"] = ["10002"]
+            config["whitelist"]["group_whitelist"][1]["only_reset"] = True
             plugin.set_plugin_config(config)
             await plugin.on_config_update("self", config, "1.1.0")
             assert (await plugin.filter_group_messages(message))["action"] == "continue"
@@ -530,7 +586,8 @@ def test_reset_command_fetches_and_sends_latest_notification() -> None:
     ]
 
 
-def test_automatic_notification_retries_only_failed_image() -> None:
+@pytest.mark.parametrize("only_reset", [False, True])
+def test_automatic_notification_retries_only_failed_image(only_reset: bool) -> None:
     """自动通知截图首次失败后，下一轮只重试图片。"""
 
     class FakeSendCapability:
@@ -554,7 +611,7 @@ def test_automatic_notification_retries_only_failed_image() -> None:
         events: List[Any] = []
         plugin = plugin_module.CodexResetNotifyPlugin()
         config = plugin.build_default_config()
-        config["whitelist"].update(group_whitelist=["10001"], group_only_reset=True)
+        config["whitelist"]["group_whitelist"] = [{"group_id": "10001", "only_reset": only_reset}]
         plugin.set_plugin_config(config)
         plugin._ctx = FakeContext(events)
         plugin._state = plugin_module.MonitorState(

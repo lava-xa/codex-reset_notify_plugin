@@ -5,9 +5,13 @@ config_version = "1.1.0"
 notify_on_first_run = false
 
 [whitelist]
-# QQ 群号，使用字符串。机器人需先在目标群中收到过消息以建立真实聊天流。
+# 每个 QQ 群单独配置群号和开关。only_reset 默认 false；true 时该群仅接受 /reset。
+# 自动通知不受开关影响。机器人需先在目标群收到过消息以建立真实聊天流。
+# 示例：
+# group_whitelist = [
+#   { group_id = "123456789", only_reset = true },
+#   { group_id = "987654321", only_reset = false },
+# ]
 group_whitelist = []
-# true：上述 QQ 群只处理 /reset，忽略普通消息及其他命令；自动通知不受影响。
-group_only_reset = false
 # QQ 用户号，使用字符串。机器人需先与目标用户建立过真实私聊流。
 private_whitelist = []

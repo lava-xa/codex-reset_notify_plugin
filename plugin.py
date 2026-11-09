@@ -17,6 +17,7 @@ from aiohttp import ClientError, ClientSession, ClientTimeout
 from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase
 from maibot_sdk.types import HookMode, HookOrder
 from playwright.async_api import Error as PlaywrightError, async_playwright
+from pydantic import model_validator
 
 
 SITE_URL = "https://codex-resets.com/"
@@ -199,6 +200,21 @@ class PluginSectionConfig(PluginConfigBase):
     )
 
 
+class GroupWhitelistEntry(PluginConfigBase):
+    """单个 QQ 群的通知与消息处理配置。"""
+
+    group_id: str = Field(
+        default="",
+        description="QQ 群号",
+        json_schema_extra={"label": "群号", "placeholder": "例如：123456789"},
+    )
+    only_reset: bool = Field(
+        default=False,
+        description="该群只处理 /reset，忽略普通消息及其他命令；自动通知不受影响",
+        json_schema_extra={"label": "仅接受 /reset"},
+    )
+
+
 class WhitelistConfig(PluginConfigBase):
     """QQ 群聊与私聊通知白名单。"""
 
@@ -206,21 +222,31 @@ class WhitelistConfig(PluginConfigBase):
     __ui_icon__ = "users"
     __ui_order__ = 1
 
-    group_whitelist: List[str] = Field(
+    group_whitelist: List[GroupWhitelistEntry] = Field(
         default_factory=list,
-        description="接收通知的 QQ 群号列表",
-        json_schema_extra={"label": "群聊白名单", "placeholder": "例如：123456789"},
-    )
-    group_only_reset: bool = Field(
-        default=False,
-        description="开启后，群聊白名单中的 QQ 群只处理 /reset 命令，忽略普通消息及其他命令；自动通知不受影响",
-        json_schema_extra={"label": "白名单群聊仅接受 /reset"},
+        description="接收通知的 QQ 群列表，每个群可单独设置是否仅接受 /reset",
+        json_schema_extra={"label": "群聊白名单"},
     )
     private_whitelist: List[str] = Field(
         default_factory=list,
         description="接收通知的 QQ 用户号列表",
         json_schema_extra={"label": "私聊白名单", "placeholder": "例如：987654321"},
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_group_whitelist(cls, data: Any) -> Any:
+        """将旧群号字符串列表转换为逐群配置，保留旧版共用开关的设置。"""
+
+        if not isinstance(data, dict) or not isinstance(data.get("group_whitelist"), list):
+            return data
+        normalized = dict(data)
+        legacy_only_reset = normalized.pop("group_only_reset", False)
+        normalized["group_whitelist"] = [
+            {"group_id": entry, "only_reset": legacy_only_reset} if isinstance(entry, str) else entry
+            for entry in data["group_whitelist"]
+        ]
+        return normalized
 
 
 class CodexResetNotifyConfig(PluginConfigBase):
@@ -297,12 +323,13 @@ class CodexResetNotifyPlugin(MaiBotPlugin):
 
         del kwargs
         whitelist = self.config.whitelist
-        if not self.config.plugin.enabled or not whitelist.group_only_reset or message["platform"] != "qq":
+        if not self.config.plugin.enabled or message["platform"] != "qq":
             return {"action": "continue"}
 
         group_info = message["message_info"]["group_info"]
         if group_info is None or not any(
-            group_info["group_id"] == group_id.strip() for group_id in whitelist.group_whitelist
+            entry.only_reset and group_info["group_id"] == entry.group_id.strip()
+            for entry in whitelist.group_whitelist
         ):
             return {"action": "continue"}
         if self._is_reset_command(message):
@@ -739,7 +766,7 @@ class CodexResetNotifyPlugin(MaiBotPlugin):
 
         targets: List[NotificationTarget] = []
         seen_keys: Set[str] = set()
-        configured_groups = self.config.whitelist.group_whitelist
+        configured_groups = [entry.group_id for entry in self.config.whitelist.group_whitelist]
         configured_users = self.config.whitelist.private_whitelist
         for chat_type, configured_ids in (("group", configured_groups), ("private", configured_users)):
             for configured_id in configured_ids:
