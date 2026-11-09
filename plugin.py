@@ -14,7 +14,8 @@ import json
 import shutil
 
 from aiohttp import ClientError, ClientSession, ClientTimeout
-from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, Command, Field, MaiBotPlugin, PluginConfigBase
+from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase
+from maibot_sdk.types import HookMode, HookOrder
 from playwright.async_api import Error as PlaywrightError, async_playwright
 
 
@@ -191,7 +192,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用 Codex 额度重置通知")
-    config_version: str = Field(default="1.0.0", description="配置版本")
+    config_version: str = Field(default="1.1.0", description="配置版本")
     notify_on_first_run: bool = Field(
         default=False,
         description="首次运行时是否立即通知网站当前的最新重置",
@@ -209,6 +210,11 @@ class WhitelistConfig(PluginConfigBase):
         default_factory=list,
         description="接收通知的 QQ 群号列表",
         json_schema_extra={"label": "群聊白名单", "placeholder": "例如：123456789"},
+    )
+    group_only_reset: bool = Field(
+        default=False,
+        description="开启后，群聊白名单中的 QQ 群只处理 /reset 命令，忽略普通消息及其他命令；自动通知不受影响",
+        json_schema_extra={"label": "白名单群聊仅接受 /reset"},
     )
     private_whitelist: List[str] = Field(
         default_factory=list,
@@ -278,6 +284,55 @@ class CodexResetNotifyPlugin(MaiBotPlugin):
         if self.config.plugin.enabled:
             self._start_monitor_task()
         self.ctx.logger.info("Codex 额度重置通知配置已更新: version=%s", version)
+
+    @HookHandler(
+        "chat.receive.before_process",
+        name="codex_reset_group_filter",
+        description="白名单群聊开启仅接受 /reset 时，拦截其他入站消息",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.EARLY,
+    )
+    async def filter_group_messages(self, message: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
+        """在消息预处理和命令分发前应用群聊开关。"""
+
+        del kwargs
+        whitelist = self.config.whitelist
+        if not self.config.plugin.enabled or not whitelist.group_only_reset or message["platform"] != "qq":
+            return {"action": "continue"}
+
+        group_info = message["message_info"]["group_info"]
+        if group_info is None or not any(
+            group_info["group_id"] == group_id.strip() for group_id in whitelist.group_whitelist
+        ):
+            return {"action": "continue"}
+        if self._is_reset_command(message):
+            return {"action": "continue"}
+        return {
+            "action": "abort",
+            "custom_result": {"reason": "该群已开启仅接受 /reset，忽略其他消息"},
+        }
+
+    @staticmethod
+    def _is_reset_command(message: Dict[str, Any]) -> bool:
+        """从原始消息识别 /reset，支持前导 @ 当前机器人，拒绝媒体及引用内容。"""
+
+        if message.get("is_notify", False):
+            return False
+        text_parts: List[str] = []
+        for component in message["raw_message"]:
+            if component["type"] == "text":
+                text_parts.append(component["data"])
+            elif (
+                component["type"] == "at"
+                and not any(part.strip() for part in text_parts)
+                and message.get("account_id")
+                and component["data"]["target_user_id"] == message["account_id"]
+            ):
+                continue
+            else:
+                return False
+        # 与宿主预处理一致，文本片段之间用空格连接，避免把 /re + set 误判为命令。
+        return " ".join(text_parts).strip() == "/reset"
 
     @Command(
         "codex_reset_latest",

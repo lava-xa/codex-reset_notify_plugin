@@ -3,7 +3,7 @@
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import asyncio
 import inspect
@@ -13,6 +13,7 @@ import tomllib
 
 from maibot_sdk import MaiBotPlugin
 from maibot_sdk.context import PluginContext, PluginPaths
+import pytest
 
 
 def _load_plugin_module() -> ModuleType:
@@ -41,10 +42,13 @@ def test_sdk_factory_lifecycle_and_command_contract() -> None:
         assert getattr(type(plugin), method_name) is not getattr(MaiBotPlugin, method_name)
     assert plugin.get_config_reload_subscriptions() == []
     assert isinstance(PluginContext("codex-reset.notify-plugin").paths.data_dir, Path)
-    components = plugin.get_components()
-    assert len(components) == 1
-    assert components[0]["type"] == "COMMAND"
-    assert components[0]["metadata"]["command_pattern"] == r"^/reset$"
+    components = {component["type"]: component for component in plugin.get_components()}
+    assert set(components) == {"COMMAND", "HOOK_HANDLER"}
+    assert components["COMMAND"]["metadata"]["command_pattern"] == r"^/reset$"
+    hook_metadata = components["HOOK_HANDLER"]["metadata"]
+    assert hook_metadata["hook"] == "chat.receive.before_process"
+    assert hook_metadata["mode"] == "blocking"
+    assert hook_metadata["order"] == "early"
 
 
 def test_config_example_matches_sdk_defaults_and_generates_schema() -> None:
@@ -58,6 +62,116 @@ def test_config_example_matches_sdk_defaults_and_generates_schema() -> None:
     assert plugin._configured_targets() == []
     schema = plugin.build_config_schema(plugin_id="codex-reset.notify-plugin")
     assert schema["sections"]["whitelist"]["fields"]["group_whitelist"]["item_type"] == "string"
+    reset_switch = schema["sections"]["whitelist"]["fields"]["group_only_reset"]
+    assert reset_switch["type"] == "boolean"
+    assert reset_switch["default"] is False
+    assert reset_switch["ui_type"] == "switch"
+
+
+@pytest.mark.parametrize(
+    ("components", "expected_action"),
+    [
+        ([{"type": "text", "data": "/reset"}], "continue"),
+        ([{"type": "text", "data": " \n/reset\t "}], "continue"),
+        ([{"type": "at", "data": {"target_user_id": "bot"}}, {"type": "text", "data": " /reset"}], "continue"),
+        ([{"type": "text", "data": "你好"}], "abort"),
+        ([{"type": "text", "data": "/help"}], "abort"),
+        ([{"type": "text", "data": "/reset now"}], "abort"),
+        ([{"type": "text", "data": "/resetting"}], "abort"),
+        ([{"type": "text", "data": "请执行 /reset"}], "abort"),
+        ([{"type": "text", "data": "/RESET"}], "abort"),
+        ([{"type": "text", "data": "/re"}, {"type": "text", "data": "set"}], "abort"),
+        ([], "abort"),
+        ([{"type": "image", "data": "/reset"}], "abort"),
+        ([{"type": "voice", "data": "/reset"}], "abort"),
+        ([{"type": "emoji", "data": "表情"}], "abort"),
+        ([{"type": "file", "data": {"name": "/reset"}}], "abort"),
+        ([{"type": "text", "data": "/reset"}, {"type": "image", "data": "图片"}], "abort"),
+        ([{"type": "reply", "data": {"target_message_content": "/reset"}}], "abort"),
+        ([{"type": "forward", "data": [{"content": [{"type": "text", "data": "/reset"}]}]}], "abort"),
+        ([{"type": "at", "data": {"target_user_id": "other"}}, {"type": "text", "data": "/reset"}], "abort"),
+        ([{"type": "text", "data": "/reset"}, {"type": "at", "data": {"target_user_id": "bot"}}], "abort"),
+    ],
+)
+def test_group_only_reset_filters_inbound_message_types(
+    components: List[Dict[str, Any]], expected_action: str,
+) -> None:
+    """白名单群只放行独立 /reset，不能从媒体、引用或其他文本中提取命令。"""
+
+    plugin = plugin_module.create_plugin()
+    config = plugin.build_default_config()
+    config["whitelist"].update(group_whitelist=["10001"], group_only_reset=True)
+    plugin.set_plugin_config(config)
+    message = {
+        "platform": "qq",
+        "account_id": "bot",
+        "message_info": {"group_info": {"group_id": "10001"}},
+        "raw_message": components,
+    }
+    result = asyncio.run(plugin.filter_group_messages(message))
+    assert result["action"] == expected_action
+    if expected_action == "abort":
+        assert result["custom_result"]["reason"]
+
+
+@pytest.mark.parametrize(
+    ("enabled", "only_reset", "platform", "group_id", "groups", "expected_action"),
+    [
+        (True, True, "qq", "10001", ["10001"], "abort"),
+        (True, True, "qq", "10001", [" 10001 ", "10002"], "abort"),
+        (True, True, "qq", "10002", ["10001", "10002"], "abort"),
+        (False, True, "qq", "10001", ["10001"], "continue"),
+        (True, False, "qq", "10001", ["10001"], "continue"),
+        (True, None, "qq", "10001", ["10001"], "continue"),
+        (True, True, "qq", "10002", ["10001"], "continue"),
+        (True, True, "qq", "10001", [], "continue"),
+        (True, True, "qq", None, ["10001"], "continue"),
+        (True, True, "telegram", "10001", ["10001"], "continue"),
+    ],
+)
+def test_group_only_reset_respects_scope_and_legacy_config(
+    enabled: bool,
+    only_reset: Optional[bool],
+    platform: str,
+    group_id: Optional[str],
+    groups: List[str],
+    expected_action: str,
+) -> None:
+    """禁用插件、旧配置、其他群、私聊和其他平台保持原有处理流程。"""
+
+    plugin = plugin_module.create_plugin()
+    config = plugin.build_default_config()
+    config["plugin"]["enabled"] = enabled
+    config["whitelist"]["group_whitelist"] = groups
+    if only_reset is not None:
+        config["whitelist"]["group_only_reset"] = only_reset
+    else:
+        config["plugin"]["config_version"] = "1.0.0"
+        del config["whitelist"]["group_only_reset"]
+    plugin.set_plugin_config(config)
+    message = {
+        "platform": platform,
+        "message_info": {"group_info": {"group_id": group_id} if group_id else None},
+        "raw_message": [{"type": "text", "data": "你好"}],
+    }
+    result = asyncio.run(plugin.filter_group_messages(message))
+    assert result["action"] == expected_action
+
+
+def test_group_only_reset_does_not_treat_notice_text_as_command() -> None:
+    """群通知携带 /reset 文本时也应忽略。"""
+
+    plugin = plugin_module.create_plugin()
+    config = plugin.build_default_config()
+    config["whitelist"].update(group_whitelist=["10001"], group_only_reset=True)
+    plugin.set_plugin_config(config)
+    result = asyncio.run(plugin.filter_group_messages({
+        "platform": "qq",
+        "message_info": {"group_info": {"group_id": "10001"}},
+        "raw_message": [{"type": "text", "data": "/reset"}],
+        "is_notify": True,
+    }))
+    assert result["action"] == "abort"
 
 
 def test_stream_lookup_uses_real_sdk_response_normalization() -> None:
@@ -104,7 +218,14 @@ def test_lifecycle_hot_update_stops_monitor_and_closes_session(tmp_path) -> None
         ))
         config = plugin.build_default_config()
         config["plugin"]["enabled"] = False
+        config["whitelist"]["group_whitelist"] = ["10001"]
+        config["whitelist"]["group_only_reset"] = True
         plugin.set_plugin_config(config)
+        message = {
+            "platform": "qq",
+            "message_info": {"group_info": {"group_id": "10001"}},
+            "raw_message": [{"type": "text", "data": "你好"}],
+        }
 
         async def idle_monitor():
             await asyncio.Event().wait()
@@ -118,6 +239,7 @@ def test_lifecycle_hot_update_stops_monitor_and_closes_session(tmp_path) -> None
             assert plugin._state_path.parent.is_dir()
             assert session is not None and not session.closed
             assert plugin._monitor_task is None
+            assert (await plugin.filter_group_messages(message))["action"] == "continue"
 
             config["plugin"]["enabled"] = True
             plugin.set_plugin_config(config)
@@ -127,6 +249,20 @@ def test_lifecycle_hot_update_stops_monitor_and_closes_session(tmp_path) -> None
             await asyncio.sleep(0)
             await plugin.on_config_update("bot", {}, "1.0.0")
             assert plugin._monitor_task is monitor_task
+            assert (await plugin.filter_group_messages(message))["action"] == "abort"
+
+            config["whitelist"]["group_only_reset"] = False
+            plugin.set_plugin_config(config)
+            await plugin.on_config_update("self", config, "1.1.0")
+            assert (await plugin.filter_group_messages(message))["action"] == "continue"
+
+            config["whitelist"]["group_only_reset"] = True
+            config["whitelist"]["group_whitelist"] = ["10002"]
+            plugin.set_plugin_config(config)
+            await plugin.on_config_update("self", config, "1.1.0")
+            assert (await plugin.filter_group_messages(message))["action"] == "continue"
+            message["message_info"]["group_info"]["group_id"] = "10002"
+            assert (await plugin.filter_group_messages(message))["action"] == "abort"
 
             config["plugin"]["enabled"] = False
             plugin.set_plugin_config(config)
@@ -417,6 +553,9 @@ def test_automatic_notification_retries_only_failed_image() -> None:
     async def run_delivery():
         events: List[Any] = []
         plugin = plugin_module.CodexResetNotifyPlugin()
+        config = plugin.build_default_config()
+        config["whitelist"].update(group_whitelist=["10001"], group_only_reset=True)
+        plugin.set_plugin_config(config)
         plugin._ctx = FakeContext(events)
         plugin._state = plugin_module.MonitorState(
             reset_id="2094251180121854309",
@@ -426,7 +565,6 @@ def test_automatic_notification_retries_only_failed_image() -> None:
             text_delivered_target_keys=set(),
             image_delivered_target_keys=set(),
         )
-        plugin._configured_targets = lambda: [plugin_module.NotificationTarget(chat_type="group", target_id="10001")]
         plugin._save_state = lambda: None
 
         async def resolve_stream_id(target):

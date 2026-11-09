@@ -1,11 +1,13 @@
 [plugin]
 enabled = true
-config_version = "1.0.0"
+config_version = "1.1.0"
 # false：首次启动只记录当前公告，不补发历史通知；true：立即通知白名单。
 notify_on_first_run = false
 
 [whitelist]
 # QQ 群号，使用字符串。机器人需先在目标群中收到过消息以建立真实聊天流。
 group_whitelist = []
+# true：上述 QQ 群只处理 /reset，忽略普通消息及其他命令；自动通知不受影响。
+group_only_reset = false
 # QQ 用户号，使用字符串。机器人需先与目标用户建立过真实私聊流。
 private_whitelist = []
