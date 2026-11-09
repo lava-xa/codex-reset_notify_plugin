@@ -1,5 +1,6 @@
 # Codex 额度重置通知插件
 
+
 发送内容示例:
 
 ```text
@@ -14,6 +15,9 @@ Latest Codex limit reset：2026-08-31 02:29:25 UTC
 - 截图由Chrome/Chromium 截图实现
 - 目前重置通知url目前来自：https://codex-resets.com/
 
+## 使用指南
+
+确保安装了Chromium 或有可以使用的浏览器，从插件商店内下载或克隆到/plugins下即可
 
 ## 截图依赖
 

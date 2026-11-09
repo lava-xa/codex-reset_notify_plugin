@@ -1,5 +1,6 @@
 {
   "manifest_version": 2,
+  "id": "github.lava-xa.codex-reset_notify_plugin",
   "version": "1.1.2",
   "name": "Codex 额度重置通知",
   "description": "每五分钟监控 codex-resets.com，并将新的 Codex 额度重置与对应公告截图发送到 QQ 白名单。",
@@ -53,6 +54,5 @@
     "supported_locales": [
       "zh-CN"
     ]
-  },
-  "id": "codex-reset.notify-plugin"
+  }
 }
